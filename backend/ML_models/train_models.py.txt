@@ -1,0 +1,206 @@
+import os
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Dense, LSTM, Conv1D, Input, GlobalAveragePooling1D, Attention, Concatenate, Dropout, Bidirectional
+from tensorflow.keras.callbacks import EarlyStopping
+from xgboost import XGBRegressor
+import yfinance as yf
+
+# Create directories if they don't exist.
+os.makedirs("data", exist_ok=True)
+os.makedirs("models", exist_ok=True)
+os.makedirs("predictions", exist_ok=True)
+
+LOOK_BACK = 20  # 20-day window
+
+# -------------------------------
+# 1. Data Download and Preprocessing
+# -------------------------------
+def download_stock_data(ticker, start_date, end_date):
+    data = yf.download(ticker, start=start_date, end=end_date)
+    data = data.asfreq('B')  # Ensure business day frequency.
+    data = data.copy()
+    data['Close'] = data['Close'].ffill().bfill()  # Forward then backward fill.
+    return data['Close']
+
+# -------------------------------
+# 2. Create Sliding Window Dataset for Daily Difference Prediction
+# -------------------------------
+def create_sliding_window_diff(price_array, look_back=LOOK_BACK):
+    X, y, last_price = [], [], []
+    for i in range(len(price_array) - look_back):
+        window = price_array[i:i+look_back].reshape(look_back)
+        diff = price_array[i+look_back] - price_array[i+look_back-1]
+        X.append(window)
+        y.append(diff[0])
+        last_price.append(price_array[i+look_back-1][0])
+    return np.array(X), np.array(y), np.array(last_price)
+
+# -------------------------------
+# 3. Build the Stacked Attention-based CNN-LSTM Model with Bidirectional LSTM
+# -------------------------------
+def build_model(input_shape):
+    inputs = Input(shape=input_shape)
+    cnn_out = Conv1D(filters=64, kernel_size=3, activation='relu', padding="same")(inputs)
+    cnn_out = Dropout(0.3)(cnn_out)
+    query = Dense(64, activation='relu')(cnn_out)
+    value = Dense(64, activation='relu')(cnn_out)
+    attention_out = Attention()([query, value])
+    lstm_out = Bidirectional(LSTM(128, return_sequences=True))(attention_out)
+    lstm_out = Dropout(0.3)(lstm_out)
+    lstm_out = LSTM(64, return_sequences=False)(lstm_out)
+    lstm_out = Dropout(0.3)(lstm_out)
+    pooled_out = GlobalAveragePooling1D()(cnn_out)
+    merged = Concatenate()([lstm_out, pooled_out])
+    dense = Dense(64, activation='relu')(merged)
+    dense = Dropout(0.3)(dense)
+    dense = Dense(32, activation='relu')(dense)
+    outputs = Dense(1)(dense)
+    model = Model(inputs, outputs)
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    return model
+
+# -------------------------------
+# 4. Weighted Ensemble Prediction and Evaluation (Reconstruct Price)
+# -------------------------------
+def weighted_ensemble_predict_and_evaluate(xgb_model, deep_model, X_test_flat, X_test_model, 
+                                           y_test_scaled, test_last_price, target_scaler, 
+                                           w_xgb=0.70, w_deep=0.30):
+    xgb_pred_scaled = xgb_model.predict(X_test_flat)
+    deep_pred_scaled = deep_model.predict(X_test_model).flatten()
+    ensemble_pred_scaled = w_xgb * xgb_pred_scaled + w_deep * deep_pred_scaled
+    pred_diff = target_scaler.inverse_transform(ensemble_pred_scaled.reshape(-1, 1)).flatten()
+    pred_price = test_last_price + pred_diff
+    actual_diff = target_scaler.inverse_transform(y_test_scaled.reshape(-1, 1)).flatten()
+    actual_price = test_last_price + actual_diff
+    mae = mean_absolute_error(actual_price, pred_price)
+    rmse = np.sqrt(mean_squared_error(actual_price, pred_price))
+    mape = np.mean(np.abs((actual_price - pred_price) / actual_price)) * 100
+    return pred_price, actual_price, mae, rmse, mape
+
+# -------------------------------
+# 5. Main Pipeline: Train, Save, and Predict for Each Ticker
+# -------------------------------
+def train_and_save_model(ticker):
+    print(f"Processing {ticker} ...")
+    # Set training period
+    start_date = '2019-10-01'
+    end_date = '2024-12-31'
+    raw_data = download_stock_data(ticker, start_date, end_date)
+    # Save raw data as CSV for verification.
+    raw_data.to_csv(f"data/{ticker}_data.csv")
+    print(f"Data for {ticker} downloaded and saved to data/{ticker}_data.csv. Shape: {raw_data.shape}")
+    
+    # Split the data into 80% train, 10% validation, 10% test (by index).
+    total = len(raw_data)
+    train_series = raw_data.iloc[:int(total * 0.8)]
+    val_series = raw_data.iloc[int(total * 0.8):int(total * 0.9)]
+    test_series = raw_data.iloc[int(total * 0.9):]
+    
+    train_prices = train_series.values.reshape(-1, 1)
+    val_prices = val_series.values.reshape(-1, 1)
+    test_prices = test_series.values.reshape(-1, 1)
+    
+    X_train_raw, y_train_raw, _ = create_sliding_window_diff(train_prices, look_back=LOOK_BACK)
+    X_val_raw, y_val_raw, _ = create_sliding_window_diff(val_prices, look_back=LOOK_BACK)
+    X_test_raw, y_test_raw, last_test = create_sliding_window_diff(test_prices, look_back=LOOK_BACK)
+    
+    # Scale the inputs using training data.
+    input_scaler = MinMaxScaler(feature_range=(0, 1))
+    X_train_scaled = input_scaler.fit_transform(X_train_raw)
+    X_val_scaled = input_scaler.transform(X_val_raw)
+    X_test_scaled = input_scaler.transform(X_test_raw)
+    
+    # Scale the targets using training data.
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    y_train_scaled = target_scaler.fit_transform(y_train_raw.reshape(-1, 1)).flatten()
+    y_val_scaled = target_scaler.transform(y_val_raw.reshape(-1, 1)).flatten()
+    y_test_scaled = target_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
+    
+    # Reshape for the deep model.
+    X_train_model = X_train_scaled.reshape((X_train_scaled.shape[0], LOOK_BACK, 1))
+    X_val_model = X_val_scaled.reshape((X_val_scaled.shape[0], LOOK_BACK, 1))
+    X_test_model = X_test_scaled.reshape((X_test_scaled.shape[0], LOOK_BACK, 1))
+    
+    # Build and train the deep model.
+    deep_model = build_model((LOOK_BACK, 1))
+    print(f"Training deep learning model for {ticker}...")
+    early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+    deep_model.fit(X_train_model, y_train_scaled, epochs=300, batch_size=32, verbose=1,
+                   validation_data=(X_val_model, y_val_scaled), callbacks=[early_stop])
+    
+    # Train XGBoost on flattened inputs.
+    X_train_flat = X_train_model.reshape((X_train_model.shape[0], -1))
+    X_test_flat = X_test_model.reshape((X_test_model.shape[0], -1))
+    
+    xgb_model = XGBRegressor(
+        objective='reg:squarederror',
+        n_estimators=4000,
+        learning_rate=0.0005,
+        max_depth=3,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=42
+    )
+    print(f"Training XGBoost model for {ticker}...")
+    xgb_model.fit(X_train_flat, y_train_scaled)
+    
+    # Evaluate ensemble performance on test set.
+    pred_price, actual_price, mae, rmse, mape = weighted_ensemble_predict_and_evaluate(
+        xgb_model, deep_model, X_test_flat, X_test_model, y_test_scaled, last_test, target_scaler,
+        w_xgb=0.70, w_deep=0.30
+    )
+    print(f"{ticker} Ensemble Metrics - MAE: {mae:.4f} INR, RMSE: {rmse:.4f} INR, MAPE: {mape:.2f}%")
+    
+    # Save predictions to CSV for verification.
+    dates_test = test_series.index[LOOK_BACK:]
+    results_df = pd.DataFrame({
+        'Date': dates_test,
+        'Actual Price': actual_price.flatten(),
+        'Predicted Price': pred_price.flatten()
+    })
+    results_csv = f"predictions/{ticker}_predictions.csv"
+    results_df.to_csv(results_csv, index=False)
+    print(f"Predictions for {ticker} saved to {results_csv}.")
+    
+    # Predict next day's price.
+    # Use the last LOOK_BACK days from test_prices.
+    last_window_raw = test_prices[-LOOK_BACK:]
+    last_window_raw_flat = last_window_raw.reshape(1, LOOK_BACK)
+    last_window_scaled = input_scaler.transform(last_window_raw_flat)
+    last_window_model = last_window_scaled.reshape((1, LOOK_BACK, 1))
+    next_day_pred_deep = deep_model.predict(last_window_model).flatten()
+    next_day_pred_xgb = xgb_model.predict(last_window_model.reshape(1, -1))
+    ensemble_next_day_pred = 0.70 * next_day_pred_xgb + 0.30 * next_day_pred_deep
+    next_day_diff = target_scaler.inverse_transform(ensemble_next_day_pred.reshape(-1, 1))[0, 0]
+    last_price_value = test_prices[-1][0]
+    next_day_price = last_price_value + next_day_diff
+    print(f"The predicted price for the next business day for {ticker} is: INR {next_day_price:.2f}\n")
+    
+    # Save models and scalers.
+    prefix = ticker.split('.')[0]
+    deep_model.save(f"models/{prefix}_deep_model.h5")
+    joblib.dump(xgb_model, f"models/{prefix}_xgb_model.pkl")
+    joblib.dump(input_scaler, f"models/{prefix}_input_scaler.pkl")
+    joblib.dump(target_scaler, f"models/{prefix}_target_scaler.pkl")
+    print(f"Models for {ticker} saved.\n")
+
+if __name__ == "__main__":
+    tickers = [
+        # Financial Services:
+         "HEROMOTOCO.NS",
+        # Metals and Mining:
+        "TATASTEEL.NS", "HINDALCO.NS", "JSWSTEEL.NS", "COALINDIA.NS", "VEDL.NS",
+        # Telecommunications:
+        "BHARTIARTL.NS", "IDEA.NS", "MTNL.NS", "TEJASNET.NS",
+        # Power:
+        "NTPC.NS", "POWERGRID.NS", "TATAPOWER.NS", "ADANIGREEN.NS", "NHPC.NS",
+        # Construction and Engineering:
+        "LT.NS", "DLF.NS", "GODREJPROP.NS", "OBEROIRLTY.NS", "PRESTIGE.NS"
+    ]
+    for ticker in tickers:
+        train_and_save_model(ticker)
