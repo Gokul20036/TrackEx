@@ -48,5 +48,27 @@ This ensemble approach ensures both **pattern recognition** and **forecast preci
 
 ---
 
-## 📂 Project Structure
+## 📌 Purpose
 
+TrackEx is built to help users — especially students and young professionals — track their financial habits, understand tax basics, make secure payments, and explore basic stock forecasting through machine learning.
+
+---
+
+## 🛡️ Security
+
+- Razorpay is used for secure payments  
+- Backend secured with Django’s built-in auth system and environment-based settings
+
+---
+
+## 👨‍💻 Developer
+
+**Gokul Sreekumar**
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
+
+---
