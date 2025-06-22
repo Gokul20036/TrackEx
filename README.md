@@ -61,7 +61,21 @@ TrackEx is built to help users — especially students and young professionals �
 
 ---
 
-## 👨‍💻 Developer
+## 👥 Team
+
+This project was developed by:
+
+- **Gokul Sreekumar**
+- **Shikha Anna Eapen**
+- **Sreyas Das**
+- **Mridul Chundran**
+
+TrackEx was built as a collaborative academic project as part of our final-year submission.  
+Gokul led the backend and machine learning development, while others contributed to the frontend, payments, and tax modules.
+
+---
+
+## 👨‍💻 Repository Maintainer
 
 **Gokul Sreekumar**
 
